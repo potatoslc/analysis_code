@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Mar 11 21:05:22 2026
-
-@author: potato
-"""
-
 import yt
 import numpy as np
 import pandas as pd
@@ -17,7 +9,7 @@ import time
 import math
 
 
-def read_get_flamex(d1,  Tcut = 310, x_cut=0.07 ):
+def read_get_flamex(d1,  Tcut = 310, x_cut=0.07, ):
     import yt
     import numpy as np
     import pandas as pd
@@ -43,7 +35,7 @@ def read_get_flamex(d1,  Tcut = 310, x_cut=0.07 ):
         x = g[("index", "x")].ndarray_view().ravel()
         T = g[Tkey].ndarray_view().ravel()
     
-        mask = (T > Tcut  ) & (x <= x_cut )
+        mask = (T >= Tcut  ) & (x <= x_cut )
         if not np.any(mask):
             continue
     
@@ -60,10 +52,14 @@ def read_get_flamex(d1,  Tcut = 310, x_cut=0.07 ):
         chunks.append(pd.DataFrame(data))
     
     df_350 = pd.concat(chunks, ignore_index=True)
-    #print(df_350['x'].min(),df_350['x'].max())
-    x_cold_region = df_350['x'].min()-0.003
+    print(df_350['x'].min(),df_350['x'].max())
+    x_cold_region = df_350['x'].min()
+    minidx = df_350['x'].idxmin()
+    min_ptx = df_350['x'].iloc[minidx]
+    min_pty = df_350['y'].iloc[minidx]
+    min_ptz = df_350['z'].iloc[minidx]
 
-    return x_cold_region
+    return [min_ptx,min_pty,min_ptz]
 
 
 
@@ -838,16 +834,19 @@ def add_xlower_ghostcell(df,x_cold_hot, T_cold_hot:list , ghost_direct_name = ' 
 def get_padded_box_arrays(
     d1,
     x_cut_region=(0.066, 0.072),
+    y_cut_region=None,
+    z_cut_region=None,
     yh2_ub=0.01304,
     ny_pad=4,
     add_zlower_ghost=True,
-    zghost_mode="edge",   # edge ~ Neumann-like ghost
+    zghost_mode="edge",
 ):
     import yt
     import numpy as np
 
     ds = yt.load(d1)
 
+    # --- fields ---
     T_field   = ("boxlib", "temp")
     HRR_field = ("boxlib", "HeatRelease")
     Ux_field  = ("boxlib", "x_velocity")
@@ -857,6 +856,7 @@ def get_padded_box_arrays(
 
     mass_fields = [f for f in ds.field_list if "Y(" in f[1]]
 
+    # --- grid info ---
     level = ds.index.max_level
     dims_full = ds.domain_dimensions * (2 ** level)
 
@@ -864,25 +864,71 @@ def get_padded_box_arrays(
     dy = float(ds.domain_width[1] / dims_full[1])
     dz = float(ds.domain_width[2] / dims_full[2])
 
-    x_left, x_right = x_cut_region
     dom_x0 = float(ds.domain_left_edge[0])
+    dom_y0 = float(ds.domain_left_edge[1])
+    dom_z0 = float(ds.domain_left_edge[2])
 
-    i0 = max(0, int(np.floor((x_left  - dom_x0) / dx)))
-    i1 = min(int(dims_full[0]) - 1, int(np.ceil((x_right - dom_x0) / dx)))
+    dom_x1 = float(ds.domain_right_edge[0])
+    dom_y1 = float(ds.domain_right_edge[1])
+    dom_z1 = float(ds.domain_right_edge[2])
 
+    # =========================
+    # X CUT（必须给）
+    # =========================
+    x_left, x_right = x_cut_region
+    x_left  = max(x_left,  dom_x0)
+    x_right = min(x_right, dom_x1)
+
+    i0 = int(np.floor((x_left  - dom_x0) / dx))
+    i1 = int(np.ceil((x_right - dom_x0) / dx))
+
+    # =========================
+    # Y CUT（None → full）
+    # =========================
+    if y_cut_region is None:
+        j0, j1 = 0, int(dims_full[1]) - 1
+        y_is_full = True
+    else:
+        y_left, y_right = y_cut_region
+        y_left  = max(y_left,  dom_y0)
+        y_right = min(y_right, dom_y1)
+
+        j0 = int(np.floor((y_left  - dom_y0) / dy))
+        j1 = int(np.ceil((y_right - dom_y0) / dy))
+        y_is_full = False
+
+    # =========================
+    # Z CUT（None → full）
+    # =========================
+    if z_cut_region is None:
+        k0, k1 = 0, int(dims_full[2]) - 1
+    else:
+        z_left, z_right = z_cut_region
+        z_left  = max(z_left,  dom_z0)
+        z_right = min(z_right, dom_z1)
+
+        k0 = int(np.floor((z_left  - dom_z0) / dz))
+        k1 = int(np.ceil((z_right - dom_z0) / dz))
+
+    # --- local dims ---
     nx_local = i1 - i0 + 1
-    ny_full = int(dims_full[1])
-    nz_full = int(dims_full[2])
+    ny_local = j1 - j0 + 1
+    nz_local = k1 - k0 + 1
 
+    # --- left edge ---
     left_edge = ds.domain_left_edge.copy()
-    left_edge[0] = ds.domain_left_edge[0] + i0 * dx
+    left_edge[0] = dom_x0 + i0 * dx
+    left_edge[1] = dom_y0 + j0 * dy
+    left_edge[2] = dom_z0 + k0 * dz
 
+    # --- covering grid ---
     cg = ds.covering_grid(
         level=level,
         left_edge=left_edge,
-        dims=np.array([nx_local, ny_full, nz_full], dtype=int),
+        dims=np.array([nx_local, ny_local, nz_local], dtype=int),
     )
 
+    # --- extract fields ---
     x = cg[("index", "x")].v
     y = cg[("index", "y")].v
     z = cg[("index", "z")].v
@@ -896,31 +942,37 @@ def get_padded_box_arrays(
 
     mass_data = {f[1]: cg[f].v for f in mass_fields}
 
-    # progress variable: no clip
+    # --- progress variable ---
     c = 1.0 - YH2 / yh2_ub
 
-    # y periodic padding
+    # =========================
+    # Y padding
+    # =========================
     pad_cfg_y = ((0, 0), (ny_pad, ny_pad), (0, 0))
+    pad_mode_y = "wrap" if y_is_full else "edge"
 
-    x_pad  = np.pad(x,  pad_cfg_y, mode="wrap")
-    y_pad  = np.pad(y,  pad_cfg_y, mode="wrap")
-    z_pad  = np.pad(z,  pad_cfg_y, mode="wrap")
+    x_pad  = np.pad(x,  pad_cfg_y, mode=pad_mode_y)
+    y_pad  = np.pad(y,  pad_cfg_y, mode=pad_mode_y)
+    z_pad  = np.pad(z,  pad_cfg_y, mode=pad_mode_y)
 
-    T_pad  = np.pad(T,  pad_cfg_y, mode="wrap")
-    Q_pad  = np.pad(Q,  pad_cfg_y, mode="wrap")
-    Ux_pad = np.pad(Ux, pad_cfg_y, mode="wrap")
-    Uy_pad = np.pad(Uy, pad_cfg_y, mode="wrap")
-    Uz_pad = np.pad(Uz, pad_cfg_y, mode="wrap")
-    c_pad  = np.pad(c,  pad_cfg_y, mode="wrap")
+    T_pad  = np.pad(T,  pad_cfg_y, mode=pad_mode_y)
+    Q_pad  = np.pad(Q,  pad_cfg_y, mode=pad_mode_y)
+    Ux_pad = np.pad(Ux, pad_cfg_y, mode=pad_mode_y)
+    Uy_pad = np.pad(Uy, pad_cfg_y, mode=pad_mode_y)
+    Uz_pad = np.pad(Uz, pad_cfg_y, mode=pad_mode_y)
+    c_pad  = np.pad(c,  pad_cfg_y, mode=pad_mode_y)
 
-    mass_pad = {k: np.pad(v, pad_cfg_y, mode="wrap") for k, v in mass_data.items()}
+    mass_pad = {k: np.pad(v, pad_cfg_y, mode=pad_mode_y) for k, v in mass_data.items()}
 
-    Ly = float(ds.domain_right_edge[1] - ds.domain_left_edge[1])
-    if ny_pad > 0:
+    # --- periodic coordinate fix（只有 full 才需要）---
+    if y_is_full and ny_pad > 0:
+        Ly = dom_y1 - dom_y0
         y_pad[:, :ny_pad, :]  -= Ly
         y_pad[:, -ny_pad:, :] += Ly
 
-    # z lower ghost
+    # =========================
+    # Z ghost
+    # =========================
     if add_zlower_ghost:
         pad_cfg_z = ((0, 0), (0, 0), (1, 0))
 
@@ -939,6 +991,9 @@ def get_padded_box_arrays(
 
         z_pad[:, :, 0] = z_pad[:, :, 1] - dz
 
+    # =========================
+    # bbox
+    # =========================
     bbox = np.array([
         [float(x_pad.min() - dx/2), float(x_pad.max() + dx/2)],
         [float(y_pad.min() - dy/2), float(y_pad.max() + dy/2)],
@@ -1041,6 +1096,11 @@ def compute_curvature_from_padded_arrays(
     ds_u.add_gradient_fields(("stream", "ny"))
     ds_u.add_gradient_fields(("stream", "nz"))
 
+
+    
+
+    
+
     def _kappa(field, data):
         return (
             data[("stream", "nx_gradient_x")]
@@ -1103,25 +1163,417 @@ def compute_curvature_from_padded_arrays(
 
     return df, ds_u
 
-def get_curvature_m3(d1,periodic_add:int=4,x_cut_region:list=[0.05,0.075],yh2_ub=0.01304,Tcut=305,output_dir='./'):
+def get_curvature_m3(d1,save_to=None,periodic_add:int=4,x_cut_region:list=[0.05,0.075],yh2_ub=0.01304,Tcut=305,output_dir='./', ):
     import os
     box = get_padded_box_arrays(
         d1,
         x_cut_region=(x_cut_region[0], x_cut_region[1]),
+        z_cut_region=(0,1.1e-3),
         yh2_ub=yh2_ub,
         ny_pad=periodic_add,
         add_zlower_ghost=True,
     )
-    df_curv, _ = compute_curvature_from_padded_arrays(
+    df_curv = compute_curvature_from_padded_arrays_lite(
         box,
         Tcut=Tcut,
-        keep_only_original_core=False,
+        keep_only_original_core=True,
     )
     filename = d1.split('/')[-1]
-    os.makedirs(output_dir,exist_ok=True)
-    total_out_direct = output_dir+'/'+filename+'_curvature.csv'
-    df_curv.to_csv(total_out_direct)
+    
+    if save_to:
+        os.makedirs(save_to,exist_ok=True)
+        total_out_direct = save_to+'/'+filename+'_curvature.csv'
+        df_curv.to_csv(total_out_direct,index=False)
     
 
     return df_curv
+def compute_divergence_from_padded_arrays(
+    box,
+    Tcut=None,
+    keep_only_original_core=True,
+):
+    import yt
+    import numpy as np
+    import pandas as pd
 
+    # --- unpack ---
+    x = box["x"]
+    y = box["y"]
+    z = box["z"]
+    T = box["T"]
+    Q = box["Q"]
+    ux = box["ux"]
+    uy = box["uy"]
+    uz = box["uz"]
+    c = box["c"]
+    mass = box["mass"]
+
+    bbox = box["bbox"]
+    ny_pad = box["ny_pad"]
+
+    shape=ux.shape
+    
+    has_zlower_ghost = box["has_zlower_ghost"]
+    dx = box["dx"]
+
+    # --- build uniform grid (same as curvature) ---
+    data_dict = {
+        "x_velocity": (ux, "m/s"),
+        "y_velocity": (uy, "m/s"),
+        "z_velocity": (uz, "m/s"),
+        "temp": (T, "K"),
+    }
+    for k, v in mass.items():
+        data_dict[k] = v
+
+    ds_u = yt.load_uniform_grid(
+        data=data_dict,
+        domain_dimensions=ux.shape,
+        bbox=bbox,
+        length_unit="m",
+        nprocs=1,
+        unit_system="mks",
+    )
+
+    # --- gradients ---
+    ds_u.add_gradient_fields(("stream", "x_velocity"))
+    ds_u.add_gradient_fields(("stream", "y_velocity"))
+    ds_u.add_gradient_fields(("stream", "z_velocity"))
+
+    # --- divergence ---
+    def _div_u(field, data):
+        return (
+            data[("stream", "x_velocity_gradient_x")]
+            + data[("stream", "y_velocity_gradient_y")]
+            + data[("stream", "z_velocity_gradient_z")]
+        )
+
+    ds_u.add_field(
+        ("stream", "div_u"),
+        function=_div_u,
+        sampling_type="cell",
+        units="1/s",
+        force_override=True,
+    )
+
+    ad = ds_u.all_data()
+
+    dudx = ad[  ("stream", "x_velocity_gradient_x") ].v.reshape(shape)
+
+    dvdy = ad[ ("stream", "y_velocity_gradient_y") ].v.reshape(shape)
+
+    dwdz = ad[ ("stream", "z_velocity_gradient_z") ].v.reshape(shape)
+
+    
+
+    # --- assemble output (same style as curvature) ---
+    out = {
+        "x": x,
+        "y": y,
+        "z": z,
+        "T": T,
+
+        "ux": ux,
+        "uy": uy,
+        "uz": uz,
+        "umag": np.sqrt(ux**2 + uy**2 + uz**2),
+        "dudx":dudx,
+        "dvdy":dvdy,
+        "dwdz":dwdz,
+        
+        
+        "div_u": ad[("stream", "div_u")].v.reshape(shape),
+    }
+
+
+
+    # --- flatten ---
+    df = pd.DataFrame({k: v.ravel() for k, v in out.items()})
+
+    if Tcut is not None:
+        df = df[df["T"] > Tcut].copy()
+
+    # --- grid index（照抄你的）---
+    min_grid = dx
+    half_cell = min_grid / 2.0
+    df["x_grid"] = np.round((df["x"] - half_cell) / min_grid).astype(int)
+    df["y_grid"] = np.round((df["y"] - half_cell) / min_grid).astype(int)
+    df["z_grid"] = np.round((df["z"] - half_cell) / min_grid).astype(int)
+    df["global_index"] = df.index
+
+    return df, ds_u
+
+
+def compute_curvature_from_padded_arrays_lite(
+    box,
+    Tcut=None,
+    keep_only_original_core=True,
+):
+
+    import yt
+    import numpy as np
+    import pandas as pd
+
+    # -----------------------------
+    # unpack
+    # -----------------------------
+
+    x = box["x"]
+    y = box["y"]
+    z = box["z"]
+    
+    T = box["T"]
+    Q = box["Q"]
+    #yh2=box['Y(H2)']
+    c = box["c"]
+
+    bbox = box["bbox"]
+
+    ny_pad = box["ny_pad"]
+    yh2 = box['mass']["Y(H2)"]
+    has_zlower_ghost = box["has_zlower_ghost"]
+
+    dx = box["dx"]
+
+    # -----------------------------
+    # build uniform grid
+    # -----------------------------
+
+    data_dict = {
+        "c": c,
+    }
+
+    ds_u = yt.load_uniform_grid(
+        data=data_dict,
+        domain_dimensions=c.shape,
+        bbox=bbox,
+        length_unit="m",
+        nprocs=1,
+        unit_system="mks",
+    )
+
+    # -----------------------------
+    # gradients
+    # -----------------------------
+
+    ds_u.add_gradient_fields(("stream", "c"))
+
+    def _nx(field, data):
+
+        gx = data[("stream", "c_gradient_x")]
+
+        g = data[("stream", "c_gradient_magnitude")]
+
+        eps = data.ds.quan(1e-30, str(g.units))
+
+        return gx / (g + eps)
+
+    def _ny(field, data):
+
+        gy = data[("stream", "c_gradient_y")]
+
+        g = data[("stream", "c_gradient_magnitude")]
+
+        eps = data.ds.quan(1e-30, str(g.units))
+
+        return gy / (g + eps)
+
+    def _nz(field, data):
+
+        gz = data[("stream", "c_gradient_z")]
+
+        g = data[("stream", "c_gradient_magnitude")]
+
+        eps = data.ds.quan(1e-30, str(g.units))
+
+        return gz / (g + eps)
+
+    ds_u.add_field(
+        ("stream", "nx"),
+        function=_nx,
+        sampling_type="cell",
+        units="dimensionless",
+        force_override=True,
+    )
+
+    ds_u.add_field(
+        ("stream", "ny"),
+        function=_ny,
+        sampling_type="cell",
+        units="dimensionless",
+        force_override=True,
+    )
+
+    ds_u.add_field(
+        ("stream", "nz"),
+        function=_nz,
+        sampling_type="cell",
+        units="dimensionless",
+        force_override=True,
+    )
+
+    # -----------------------------
+    # second gradients
+    # -----------------------------
+
+    ds_u.add_gradient_fields(("stream", "nx"))
+    ds_u.add_gradient_fields(("stream", "ny"))
+    ds_u.add_gradient_fields(("stream", "nz"))
+
+    # -----------------------------
+    # curvature
+    # -----------------------------
+
+    def _kappa(field, data):
+
+        return (
+            data[("stream", "nx_gradient_x")]
+            + data[("stream", "ny_gradient_y")]
+            + data[("stream", "nz_gradient_z")]
+        )
+
+    ds_u.add_field(
+        ("stream", "curvature"),
+        function=_kappa,
+        sampling_type="cell",
+        units="1/m",
+        force_override=True,
+    )
+
+    ad = ds_u.all_data()
+
+    shape = c.shape
+
+    # -----------------------------
+    # ONLY KEEP NECESSARY DATA
+    # -----------------------------
+
+    out = {
+
+        "x": x,
+
+        "y": y,
+
+        "z": z,
+
+        "T": T,
+
+        "Q": Q,
+        "Y(H2)": yh2,
+        "k": ad[
+            ("stream", "curvature")
+        ].v.reshape(shape),
+    }
+
+    # -----------------------------
+    # remove padding
+    # -----------------------------
+
+    y_slice = slice(
+        ny_pad,
+        -ny_pad if ny_pad > 0 else None
+    )
+
+    z_slice = (
+        slice(1, None)
+        if has_zlower_ghost
+        else slice(None)
+    )
+
+    if keep_only_original_core:
+
+        for k in list(out.keys()):
+
+            out[k] = out[k][
+                :,
+                y_slice,
+                z_slice
+            ]
+
+    # -----------------------------
+    # flatten
+    # -----------------------------
+
+    df = pd.DataFrame({
+
+        k: v.ravel()
+
+        for k, v in out.items()
+
+    })
+
+    # -----------------------------
+    # temperature filter
+    # -----------------------------
+
+    if Tcut is not None:
+
+        df = df[
+            df["T"] > Tcut
+        ].copy()
+
+    # -----------------------------
+    # grid index
+    # -----------------------------
+
+    min_grid = dx
+
+    half_cell = min_grid / 2.0
+
+    df["x_grid"] = np.round(
+        (df["x"] - half_cell) / min_grid
+    ).astype(int)
+
+    df["y_grid"] = np.round(
+        (df["y"] - half_cell) / min_grid
+    ).astype(int)
+
+    df["z_grid"] = np.round(
+        (df["z"] - half_cell) / min_grid
+    ).astype(int)
+
+    # -----------------------------
+    # remove xyz
+    # optional
+    # -----------------------------
+
+    df = df[
+        [
+            "x_grid",
+            "y_grid",
+            "z_grid",
+            "T",
+            "Q",
+            "Y(H2)",
+            "k",
+        ]
+    ]
+
+    return df
+
+def get_strain_rate(d1,periodic_add:int=4,x_cut_region:list=[0.05,0.075],y_cut_region=None,z_cut_region=None,yh2_ub=0.01304,Tcut=305, save_to=None):
+    import os
+    filename = d1.split('/')[-1]
+    box1 = get_padded_box_arrays(
+        d1,
+        x_cut_region=x_cut_region,
+        y_cut_region=y_cut_region,
+        z_cut_region=z_cut_region,
+        yh2_ub=0.01304,
+        ny_pad=4,
+        add_zlower_ghost=True,
+    )
+    df_t2,_ = compute_divergence_from_padded_arrays(box1)
+    
+    if save_to:
+        os.makedirs(save_to,exist_ok=True)
+        total_out_direct = save_to+'/'+filename+'_strain_rate.csv'
+        df_t2.to_csv(total_out_direct)
+
+    return df_t2
+
+
+def get_combined_incsv(d1,yh2_u,save_dir,Tcut):
+    flame_position  = read_get_flamex(d1,Tcut =305, )
+    _ = get_curvature_m3(d1, periodic_add=4,x_cut_region=[flame_position[0],0.0705],yh2_ub=yh2_u,Tcut=Tcut,save_to=save_dir)
+    _ = get_strain_rate(d1, periodic_add=4,x_cut_region=[flame_position[0]-0.005,0.07], z_cut_region=[0,5.47e-4], yh2_ub=yh2_u,Tcut=Tcut,save_to=save_dir)
