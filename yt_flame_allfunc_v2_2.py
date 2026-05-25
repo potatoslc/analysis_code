@@ -854,6 +854,7 @@ def get_padded_box_arrays(
     Uz_field  = ("boxlib", "z_velocity")
     YH2_field = ("boxlib", "Y(H2)")
     pressure_field =('boxlib', 'RhoRT')
+    density_field = ('boxlib', 'density')
     mass_fields = [f for f in ds.field_list if "Y(" in f[1]]
 
     # --- grid info ---
@@ -940,6 +941,7 @@ def get_padded_box_arrays(
     Uz  = cg[Uz_field].v
     YH2 = cg[YH2_field].v
     P_rho = cg[pressure_field].v
+    rho = cg[density_field].v
     mass_data = {f[1]: cg[f].v for f in mass_fields}
 
     # --- progress variable ---
@@ -961,6 +963,7 @@ def get_padded_box_arrays(
     Uy_pad = np.pad(Uy, pad_cfg_y, mode=pad_mode_y)
     Uz_pad = np.pad(Uz, pad_cfg_y, mode=pad_mode_y)
     c_pad  = np.pad(c,  pad_cfg_y, mode=pad_mode_y)
+    rho_pad = np.pad(rho,  pad_cfg_y, mode=pad_mode_y)
     P_rho_pad=np.pad(P_rho,  pad_cfg_y, mode=pad_mode_y)
     mass_pad = {k: np.pad(v, pad_cfg_y, mode=pad_mode_y) for k, v in mass_data.items()}
 
@@ -986,7 +989,8 @@ def get_padded_box_arrays(
         Uy_pad = np.pad(Uy_pad, pad_cfg_z, mode=zghost_mode)
         Uz_pad = np.pad(Uz_pad, pad_cfg_z, mode=zghost_mode)
         c_pad  = np.pad(c_pad,  pad_cfg_z, mode=zghost_mode)
-        P_rho_pad=np.pad(P_rho,  pad_cfg_z, mode=zghost_mode)
+        P_rho_pad=np.pad(P_rho_pad,  pad_cfg_z, mode=zghost_mode)
+        rho_pad = np.pad(rho_pad,  pad_cfg_z, mode= zghost_mode )
         mass_pad = {k: np.pad(v, pad_cfg_z, mode=zghost_mode) for k, v in mass_pad.items()}
 
         z_pad[:, :, 0] = z_pad[:, :, 1] - dz
@@ -1018,6 +1022,7 @@ def get_padded_box_arrays(
         "c": c_pad,
         "mass": mass_pad,
         "P":P_rho_pad,
+        "rho":rho_pad,
     }
 
 def compute_curvature_from_padded_arrays(
@@ -1311,7 +1316,7 @@ def compute_divergence_from_padded_arrays(
     return df, ds_u
 
 
-def compute_curvature_from_padded_arrays_lite(
+def compute_curvature_from_padded_arrays_lite_old(
     box,
     Tcut=None,
     keep_only_original_core=True,
@@ -1338,6 +1343,15 @@ def compute_curvature_from_padded_arrays_lite(
 
     ny_pad = box["ny_pad"]
     yh2 = box['mass']["Y(H2)"]
+    yh = box['mass']["Y(H)"]
+    yo = box['mass']["Y(O)"]
+    yoh = box['mass']["Y(OH)"]
+    yh2o = box['mass']["Y(H2O)"]
+    yo2 = box['mass']["Y(O2)"]
+    yho2 = box['mass']["Y(HO2)"]
+    yh2o2 = box['mass']["Y(H2O2)"]
+    yn2 = box['mass']["Y(N2)"]
+    
     has_zlower_ghost = box["has_zlower_ghost"]
 
     dx = box["dx"]
@@ -1558,6 +1572,662 @@ def compute_curvature_from_padded_arrays_lite(
     ]
 
     return df
+
+
+
+def compute_curvature_from_padded_arrays_lite(
+    box,
+    Tcut=None,
+    keep_only_original_core=True,
+):
+
+    import yt
+    import numpy as np
+    import pandas as pd
+
+    # ============================================================
+    # unpack
+    # ============================================================
+
+    x = box["x"]
+    y = box["y"]
+    z = box["z"]
+
+    T = box["T"]
+    Q = box["Q"]
+
+    c = box["c"]
+
+    P = box["P"]
+
+    rho = box["rho"]
+    mass = box["mass"]
+
+    bbox = box["bbox"]
+
+    ny_pad = box["ny_pad"]
+
+    has_zlower_ghost = box["has_zlower_ghost"]
+
+    dx = box["dx"]
+
+    # ============================================================
+    # species mass fraction
+    # ============================================================
+
+    yh2   = box["mass"]["Y(H2)"]
+    yh    = box["mass"]["Y(H)"]
+    yo    = box["mass"]["Y(O)"]
+    yoh   = box["mass"]["Y(OH)"]
+    yh2o  = box["mass"]["Y(H2O)"]
+    yo2   = box["mass"]["Y(O2)"]
+    yho2  = box["mass"]["Y(HO2)"]
+    yh2o2 = box["mass"]["Y(H2O2)"]
+    yn2   = box["mass"]["Y(N2)"]
+
+    # ============================================================
+    # molecular weights
+    # ============================================================
+
+    W_H2   = 2.01588
+    W_H    = 1.00794
+    W_O    = 15.999
+    W_OH   = 17.007
+    W_H2O  = 18.01528
+    W_O2   = 31.998
+    W_HO2  = 33.006
+    W_H2O2 = 34.0147
+    W_N2   = 28.0134
+
+    # ============================================================
+    # cp calculation
+    # ============================================================
+
+    R = 8314.462618
+
+    def nasa_cp_mass(T_in, a, W):
+
+        cp_R = (
+            a[0]
+            + a[1]*T_in
+            + a[2]*T_in**2
+            + a[3]*T_in**3
+            + a[4]*T_in**4
+        )
+
+        return R * cp_R / W
+
+    a_h2 = [3.29812431, 8.24944174e-04, -8.14301529e-07, -9.47543433e-11, 4.13487224e-13]
+
+    a_h = [2.50000000,0,0,0,0]
+
+    a_o = [2.94642878,-1.63816649e-03,2.42103170e-06,-1.60284319e-09,3.89069636e-13]
+
+    a_oh = [3.99201543,-2.40131752e-03,4.61793841e-06,-3.88113333e-09,1.36411470e-12]
+
+    a_h2o = [4.19864056,-2.03643410e-03,6.52040211e-06,-5.48797062e-09,1.77197817e-12]
+
+    a_o2 = [3.78245636,-2.99673416e-03,9.84730201e-06,-9.68129509e-09,3.24372837e-12]
+
+    a_ho2 = [4.30179801,-4.74912051e-03,2.11582891e-05,-2.42763894e-08,9.29225124e-12]
+
+    a_h2o2 = [4.27611269,-5.42822417e-04,1.67335701e-05,-2.15770813e-08,8.62454363e-12]
+
+    a_n2 = [3.53100528,-1.23660987e-04,-5.02999433e-07,2.43530612e-09,-1.40881235e-12]
+
+    cp_h2 = nasa_cp_mass(T, a_h2, W_H2)
+
+    cp_h = nasa_cp_mass(T, a_h, W_H)
+
+    cp_o = nasa_cp_mass(T, a_o, W_O)
+
+    cp_oh = nasa_cp_mass(T, a_oh, W_OH)
+
+    cp_h2o = nasa_cp_mass(T, a_h2o, W_H2O)
+
+    cp_o2 = nasa_cp_mass(T, a_o2, W_O2)
+
+    cp_ho2 = nasa_cp_mass(T, a_ho2, W_HO2)
+
+    cp_h2o2 = nasa_cp_mass(T, a_h2o2, W_H2O2)
+
+    cp_n2 = nasa_cp_mass(T, a_n2, W_N2)
+
+    cp_mix = (
+
+        yh2 * cp_h2
+
+        + yh * cp_h
+
+        + yo * cp_o
+
+        + yoh * cp_oh
+
+        + yh2o * cp_h2o
+
+        + yo2 * cp_o2
+
+        + yho2 * cp_ho2
+
+        + yh2o2 * cp_h2o2
+
+        + yn2 * cp_n2
+    )
+
+    # ============================================================
+    # thermal conductivity interpolation
+    # ============================================================
+
+    T_table = np.array([
+        300,400,500,600,700,800,900,
+        1000,1100,1200,1300,1400,
+        1500,1600,1700,1800,1900,2000
+    ],dtype=float)
+
+    lambda_table = {
+
+        "H2": np.array([
+            0.186822,0.228484,0.264547,0.298359,
+            0.331276,0.363881,0.396427,0.429013,
+            0.461661,0.494361,0.527083,0.559794,
+            0.592455,0.625032,0.657492,0.689804,
+            0.721941,0.753880
+        ]),
+
+        "H": np.array([
+            0.293975,0.371383,0.439693,0.501773,
+            0.559264,0.613202,0.664287,0.713019,
+            0.759767,0.804812,0.848376,0.890633,
+            0.931730,0.971783,1.010892,1.049142,
+            1.086605,1.123343
+        ]),
+
+        "O": np.array([
+            0.050761,0.061072,0.070506,0.079265,
+            0.087488,0.095277,0.102707,0.109835,
+            0.116706,0.123355,0.129812,0.136099,
+            0.142236,0.148241,0.154126,0.159905,
+            0.165587,0.171182
+        ]),
+
+        "OH": np.array([
+            0.059315,0.071948,0.083444,0.094560,
+            0.105563,0.116551,0.127546,0.138548,
+            0.149540,0.160505,0.171424,0.182281,
+            0.193059,0.203746,0.214330,0.224800,
+            0.235149,0.245370
+        ]),
+
+        "H2O": np.array([
+            0.026240,0.037015,0.048280,0.060463,
+            0.073536,0.087356,0.101766,0.116620,
+            0.131794,0.147183,0.162699,0.178270,
+            0.193837,0.209349,0.224764,0.240049,
+            0.255174,0.270115
+        ]),
+
+        "O2": np.array([
+            0.026532,0.033939,0.041219,0.048224,
+            0.054933,0.061362,0.067540,0.073496,
+            0.079258,0.084851,0.090296,0.095612,
+            0.100816,0.105921,0.110940,0.115884,
+            0.120763,0.125584
+        ]),
+
+        "HO2": np.array([
+            0.029391,0.039455,0.049221,0.058749,
+            0.068069,0.077203,0.086166,0.094970,
+            0.103625,0.112141,0.120524,0.128782,
+            0.136920,0.144944,0.152858,0.160668,
+            0.168378,0.175991
+        ]),
+
+        "H2O2": np.array([
+            0.037047,0.050833,0.064185,0.077221,
+            0.089982,0.102484,0.114734,0.126738,
+            0.138499,0.150023,0.161314,0.172377,
+            0.183217,0.193838,0.204247,0.214448,
+            0.224445,0.234245
+        ]),
+
+        "N2": np.array([
+            0.026463,0.032735,0.038990,0.045164,
+            0.051224,0.057156,0.062956,0.068621,
+            0.074153,0.079556,0.084832,0.089985,
+            0.095020,0.099941,0.104751,0.109455,
+            0.114057,0.118559
+        ]),
+    }
+
+    def interp_lambda(T_in, sp):
+
+        T_use = np.clip(T_in,300.0,2000.0)
+
+        return np.interp(
+            T_use,
+            T_table,
+            lambda_table[sp]
+        )
+
+    # ============================================================
+    # lambda mixture
+    # ============================================================
+
+    denom = (
+
+        yh2 / W_H2
+
+        + yh / W_H
+
+        + yo / W_O
+
+        + yoh / W_OH
+
+        + yh2o / W_H2O
+
+        + yo2 / W_O2
+
+        + yho2 / W_HO2
+
+        + yh2o2 / W_H2O2
+
+        + yn2 / W_N2
+    )
+
+    denom = np.maximum(denom,1e-300)
+
+    xh2 = (yh2 / W_H2) / denom
+
+    xh = (yh / W_H) / denom
+
+    xo = (yo / W_O) / denom
+
+    xoh = (yoh / W_OH) / denom
+
+    xh2o = (yh2o / W_H2O) / denom
+
+    xo2 = (yo2 / W_O2) / denom
+
+    xho2 = (yho2 / W_HO2) / denom
+
+    xh2o2 = (yh2o2 / W_H2O2) / denom
+
+    xn2 = (yn2 / W_N2) / denom
+
+    lambda_mix = (
+
+        xh2 * interp_lambda(T,"H2")
+
+        + xh * interp_lambda(T,"H")
+
+        + xo * interp_lambda(T,"O")
+
+        + xoh * interp_lambda(T,"OH")
+
+        + xh2o * interp_lambda(T,"H2O")
+
+        + xo2 * interp_lambda(T,"O2")
+
+        + xho2 * interp_lambda(T,"HO2")
+
+        + xh2o2 * interp_lambda(T,"H2O2")
+
+        + xn2 * interp_lambda(T,"N2")
+    )
+
+    # ============================================================
+    # rho alpha
+    # ============================================================
+
+    rho_alpha = lambda_mix / cp_mix
+
+    omega_T = Q / cp_mix
+
+    # ============================================================
+    # build yt grid
+    # ============================================================
+
+    data_dict = {
+
+        "c": (c,""),
+
+        "temp": (T,"K"),
+
+        "rho_alpha": (rho_alpha,"kg/(m*s)"),
+
+        "omega_T": (omega_T,"kg*K/(m**3*s)"),
+
+        "density": (rho,"kg/m**3"),
+    }
+
+    ds_u = yt.load_uniform_grid(
+        data=data_dict,
+        domain_dimensions=c.shape,
+        bbox=bbox,
+        length_unit="m",
+        nprocs=1,
+        unit_system="mks",
+    )
+
+    # ============================================================
+    # curvature
+    # ============================================================
+
+    ds_u.add_gradient_fields(("stream", "c"))
+
+    def _nx(field, data):
+
+        gx = data[("stream", "c_gradient_x")].to("1/m")
+
+        g = data[("stream", "c_gradient_magnitude")].to("1/m")
+
+        eps = data.ds.quan(1e-8,"1/m" )
+        out = gx / (g + eps)
+        return out.to("")
+
+    def _ny(field, data):
+
+        gy = data[("stream", "c_gradient_y")].to("1/m")
+
+        g = data[("stream", "c_gradient_magnitude")].to("1/m")
+
+        eps = data.ds.quan(1e-8,"1/m" )
+
+        out = gy / (g + eps)
+        return out.to("")
+
+
+    def _nz(field, data):
+
+        gz = data[("stream", "c_gradient_z")].to("1/m")
+
+        g = data[("stream", "c_gradient_magnitude")].to("1/m")
+
+        eps = data.ds.quan(1e-8,"1/m" )
+
+        out = gz / (g + eps)
+        return out.to("")
+
+
+    ds_u.add_field(
+        ("stream", "nx"),
+        function=_nx,
+        sampling_type="cell",
+        units="",
+        force_override=True,
+    )
+
+    ds_u.add_field(
+        ("stream", "ny"),
+        function=_ny,
+        sampling_type="cell",
+        units="",
+        force_override=True,
+    )
+
+    ds_u.add_field(
+        ("stream", "nz"),
+        function=_nz,
+        sampling_type="cell",
+        units="",
+        force_override=True,
+    )
+
+    ds_u.add_gradient_fields(("stream", "nx"))
+
+    ds_u.add_gradient_fields(("stream", "ny"))
+
+    ds_u.add_gradient_fields(("stream", "nz"))
+
+    def _kappa(field, data):
+
+        return (
+            data[("stream", "nx_gradient_x")]
+            + data[("stream", "ny_gradient_y")]
+            + data[("stream", "nz_gradient_z")]
+        ).to("1/m")
+
+    ds_u.add_field(
+        ("stream", "curvature"),
+        function=_kappa,
+        sampling_type="cell",
+        units="1/m",
+        force_override=True,
+    )
+
+    # ============================================================
+    # Sd calculation
+    # ============================================================
+
+    ds_u.add_gradient_fields(("stream","temp"))
+
+    def _flux_x(field, data):
+
+        return (
+            data[("stream","rho_alpha")]
+            *
+            data[("stream","temp_gradient_x")]
+        )
+
+    def _flux_y(field, data):
+
+        return (
+            data[("stream","rho_alpha")]
+            *
+            data[("stream","temp_gradient_y")]
+        )
+
+    def _flux_z(field, data):
+
+        return (
+            data[("stream","rho_alpha")]
+            *
+            data[("stream","temp_gradient_z")]
+        )
+
+    ds_u.add_field(
+        ("stream","flux_x"),
+        function=_flux_x,
+        sampling_type="cell",
+        units="kg*K/(m**2*s)",
+        force_override=True,
+    )
+
+    ds_u.add_field(
+        ("stream","flux_y"),
+        function=_flux_y,
+        sampling_type="cell",
+        units="kg*K/(m**2*s)",
+        force_override=True,
+    )
+
+    ds_u.add_field(
+        ("stream","flux_z"),
+        function=_flux_z,
+        sampling_type="cell",
+        units="kg*K/(m**2*s)",
+        force_override=True,
+    )
+
+    ds_u.add_gradient_fields(("stream","flux_x"))
+
+    ds_u.add_gradient_fields(("stream","flux_y"))
+
+    ds_u.add_gradient_fields(("stream","flux_z"))
+
+    def _Sd(field, data):
+
+        div_flux = (
+
+            data[("stream","flux_x_gradient_x")]
+
+            + data[("stream","flux_y_gradient_y")]
+
+            + data[("stream","flux_z_gradient_z")]
+        )
+
+        gradTmag = data[
+            ("stream","temp_gradient_magnitude")
+        ]
+
+        eps = data.ds.quan(
+            1e-10,
+            str(gradTmag.units)
+        )
+
+        return (
+
+            div_flux
+
+            + data[("stream","omega_T")]
+
+        ) / (
+
+            data[("stream","density")]
+
+            * (gradTmag + eps)
+        )
+
+    ds_u.add_field(
+        ("stream","Sd"),
+        function=_Sd,
+        sampling_type="cell",
+        units="m/s",
+        force_override=True,
+    )
+
+    # ============================================================
+    # output
+    # ============================================================
+
+    ad = ds_u.all_data()
+
+    shape = c.shape
+
+    out = {
+
+        "x": x,
+
+        "y": y,
+
+        "z": z,
+
+        "T": T,
+
+        "Q": Q,
+
+        "P": P,
+
+        "rho": rho,
+
+        "cp": cp_mix,
+
+        "lambda": lambda_mix,
+
+        "k": ad[
+            ("stream","curvature")
+        ].v.reshape(shape),
+
+        "Sd": ad[
+            ("stream","Sd")
+        ].v.reshape(shape),
+        "gradT":ad[("stream", "temp_gradient_magnitude")].v.reshape(shape),
+    }
+    for k, v in mass.items():
+        out[k] = v
+
+    # ============================================================
+    # remove padding
+    # ============================================================
+
+    y_slice = slice(
+        ny_pad,
+        -ny_pad if ny_pad > 0 else None
+    )
+
+    z_slice = (
+        slice(1,None)
+        if has_zlower_ghost
+        else slice(None)
+    )
+
+    if keep_only_original_core:
+
+        for k in list(out.keys()):
+
+            out[k] = out[k][
+                :,
+                y_slice,
+                z_slice
+            ]
+
+    # ============================================================
+    # flatten
+    # ============================================================
+
+    df = pd.DataFrame({
+
+        k: v.ravel()
+
+        for k,v in out.items()
+    })
+
+    # ============================================================
+    # temperature cut
+    # ============================================================
+
+    if Tcut is not None:
+
+        df = df[
+            df["T"] > Tcut
+        ].copy()
+
+    # ============================================================
+    # grid index
+    # ============================================================
+
+    min_grid = dx
+
+    half_cell = min_grid / 2.0
+
+    df["x_grid"] = np.round(
+        (df["x"] - half_cell) / min_grid
+    ).astype(int)
+
+    df["y_grid"] = np.round(
+        (df["y"] - half_cell) / min_grid
+    ).astype(int)
+
+    df["z_grid"] = np.round(
+        (df["z"] - half_cell) / min_grid
+    ).astype(int)
+
+    # ============================================================
+    # final columns
+    # ============================================================
+
+    df = df[
+        [
+            "x_grid",
+            "y_grid",
+            "z_grid",
+            "T",
+            "Q",
+            "P",
+            "rho",
+            "cp",
+            "Y(H2)",
+            "lambda",
+            "k",
+            "Sd",
+        ]
+    ]
+
+    return df
+
+
+
+
 
 def get_strain_rate(d1,periodic_add:int=4,x_cut_region:list=[0.05,0.075],y_cut_region=None,z_cut_region=[0,5.44e-4],yh2_ub=0.01304,Tcut=305, save_to=None):
     import os
